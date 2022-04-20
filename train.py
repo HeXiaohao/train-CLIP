@@ -1,3 +1,6 @@
+# 20220420
+# clip 第三方训练代码阅读笔记
+
 import yaml
 from argparse import ArgumentParser
 from pytorch_lightning import Trainer
