@@ -1,3 +1,8 @@
+# 20220421
+# hexiaohao
+# clip 第三方训练代码阅读笔记
+# 利用别的预训练模型去 wrap clip
+
 import torch
 from argparse import ArgumentParser
 from pytorch_lightning import Trainer
@@ -17,6 +22,7 @@ def main(hparams):
     if hparams.minibatch_size < 1:
         hparams.minibatch_size = hparams.batch_size
 
+    # 使用定制化 clip_wrapper
     model = CustomCLIPWrapper(img_encoder, txt_encoder, hparams.minibatch_size, avg_word_embs=True)
     dm = TextImageDataModule.from_argparse_args(hparams, custom_tokenizer=tokenizer)
     trainer = Trainer.from_argparse_args(hparams, precision=16, max_epochs=32)

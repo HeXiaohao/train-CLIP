@@ -199,6 +199,7 @@ class CustomCLIPWrapper(CLIPWrapper):
         self.teacher = copy.deepcopy(self.model)
         self.kl_coeff = kl_coeff
 
+    # 一个 batch 的训练
     def training_step(self, train_batch, idx):
         # get optimizers and scheduler
         optimizer = self.optimizers()
@@ -206,9 +207,14 @@ class CustomCLIPWrapper(CLIPWrapper):
         image, text = train_batch
         n = math.ceil(len(image) // self.minibatch_size)
         image_mbs = torch.chunk(image, n)
+
+        # 就是把一个 tensor 按照顺序拆开
+        # >>> torch.chunk(torch.arange(4), 2)
+        # (tensor([0, 1]), tensor([2, 3]))
         text_mbs_ids = torch.chunk(torch.arange(len(image)), n)
 
         # adjust embedding dictionaries
+        # 每个 tokenizer 输出的东西有好几个，比如 encode_plus 会输出一个字典，分别为 'input_ids', 'token_type_ids', 'attention_mask' 对应的编码
         text_mbs = []
         for s in text_mbs_ids:
             d = {}
@@ -216,9 +222,13 @@ class CustomCLIPWrapper(CLIPWrapper):
                 d[key] = text[key][s]
             text_mbs.append(d)
 
+        # 计算训练之前的统计特征，包括 loss 和 acc
         # calculate original statistics
         with torch.no_grad():
+            # self.model 调用的是包装的 clip
             ims = [F.normalize(self.model.encode_image(im), dim=1) for im in image_mbs]
+
+            # self.encode_text 调用的是当前的 encoder，而且这里没用 teacher
             txt = [F.normalize(self.encode_text(t), dim=1) for t in text_mbs]
             # gather from all GPUs
             ims = self.all_gather(torch.cat(ims))
@@ -231,12 +241,16 @@ class CustomCLIPWrapper(CLIPWrapper):
                 ims = [ims]
                 txt = [txt]
 
+            # 在不进行梯度反向传播的前提下，计算 loss
+            # 这部分代码和前面的 CLIPWrapper 是一样的
             image_logits_notemp = torch.cat(ims) @ torch.cat(txt).t()
             image_logits = image_logits_notemp * self.model.logit_scale.exp()
             ground_truth = torch.arange(len(image_logits)).long().to(image_logits.device)
             loss = (F.cross_entropy(image_logits, ground_truth) + F.cross_entropy(image_logits.t(), ground_truth)).div(2)
             acc_i = (torch.argmax(image_logits, 1) == ground_truth).sum()
             acc_t = (torch.argmax(image_logits, 0) == ground_truth).sum()
+
+            # 计算 teacher 网络的相关 encode emb
             # calculate teacher
             teacher_ims = [F.normalize(self.teacher.encode_image(im), dim=1) for im in image_mbs]
             teacher_txt = [F.normalize(self.encode_text(t, teacher=True), dim=1) for t in text_mbs]
@@ -251,8 +265,10 @@ class CustomCLIPWrapper(CLIPWrapper):
                 teacher_ims = [teacher_ims]
                 teacher_txt = [teacher_txt]
 
+            # 计算 teacher 网络在 Image 侧和 Text 侧的矩阵相似性
             sim_ii, sim_tt, sim_it, sim_ti = self.compute_similarities(torch.cat(teacher_ims), torch.cat(teacher_txt))
 
+            # 计算当前网络的 image-text emb 相似性矩阵，和 teacher 网络的相似性矩阵的差距
             # optimal transport
             img_cost = - (sim_ii + sim_tt + sim_it)
             txt_cost = - (sim_ii + sim_tt + sim_ti)
@@ -289,10 +305,15 @@ class CustomCLIPWrapper(CLIPWrapper):
         lr_scheduler = self.lr_schedulers()
         lr_scheduler.step()
         self.model.logit_scale.data.clamp_(-np.log(100), np.log(100))
+
+        # 这两步 teacher 网络相关的步骤是新增的
         self.sink_temp.data.clamp_(-np.log(100), np.log(100))
         self.update_teacher()
 
+    # CustomCLIPWrapper 重新定制的 encode_text 方法
     def encode_text(self, inputs, teacher=False):
+        # bert 的输出长度和输入的词汇长度基本是一一对应的，一般只取 cls 头的输出
+        # 这里可以选择把 bert 产生的 word 的 emb 都做一个平均
         if self.avg_word_embs:
             sequence_output = self.teacher.transformer(**inputs)[0] if teacher else self.model.transformer(**inputs)[0]
 
@@ -304,11 +325,13 @@ class CustomCLIPWrapper(CLIPWrapper):
         else:
             return self.teacher.transformer(**inputs)[1] if teacher else self.model.transformer(**inputs)[1]
 
+    # 计算 teacher 网络的 Image 侧和 Text 侧的矩阵相似性
     def compute_similarities(self, I_emb, T_emb):
         sim_ii, sim_tt = I_emb @ I_emb.t(), T_emb @ T_emb.t()
         sim_it, sim_ti = I_emb @ T_emb.t(), T_emb @ I_emb.t()
         return sim_ii, sim_tt, sim_it, sim_ti
 
+    # 缓慢更新 teacher 网络的参数
     def update_teacher(self):
         for teacher, student in zip(self.teacher.parameters(), self.model.parameters()):
             teacher.data.copy_(self.ema(student.data, teacher.data))
@@ -320,6 +343,7 @@ class CustomCLIPWrapper(CLIPWrapper):
         logits = F.normalize(self.model.encode_image(images), dim=1) @ F.normalize(self.encode_text(text), dim=1).t() * self.model.logit_scale.exp()
         return logits, logits.t()
 
+    # 暂时看不懂。。。无监督学习相关的一个函数
     # Sourced from: https://github.com/facebookresearch/swav/blob/5e073db0cc69dea22aa75e92bfdd75011e888f28/main_swav.py#L354
     def sinkhorn(self, out):
         Q = torch.exp(out / 0.05).t()  # Q is K-by-B for consistency with notations from our paper
