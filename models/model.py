@@ -1,3 +1,8 @@
+# 20220421
+# hexiaohao
+# clip 第三方训练代码阅读笔记
+# 定义了 clip 的模型结构
+
 # Sourced directly from OpenAI's CLIP repo
 from collections import OrderedDict
 from typing import Tuple, Union

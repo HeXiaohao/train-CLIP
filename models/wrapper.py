@@ -1,3 +1,8 @@
+# 20220421
+# hexiaohao
+# clip 第三方训练代码阅读笔记
+# 定义整个 clip 的基础架构 wrapper。同时定义了视觉和文本的 backbone
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -31,6 +36,7 @@ class CLIPWrapper(pl.LightningModule):
 
         self.automatic_optimization = False
     
+    # 这个函数是用来计算总共需要训练多少个 steps
     # Sourced from https://github.com/PyTorchLightning/pytorch-lightning/issues/5449
     @property
     def num_training_steps(self) -> int:
@@ -48,26 +54,35 @@ class CLIPWrapper(pl.LightningModule):
         effective_batch_size = dataset.batch_size * self.trainer.accumulate_grad_batches * num_devices
         return (dataset_size // effective_batch_size) * self.trainer.max_epochs
 
+    # 感觉是每一个 batch 的具体训练？
     # Training loss: https://github.com/openai/CLIP/issues/83
     # Mini-batching thanks to https://github.com/crowsonkb / https://twitter.com/RiversHaveWings
     # Multi-GPU support: https://github.com/MicPie/clasp
     def training_step(self, train_batch, idx):
+        # 获取训练的优化器
         # get optimizers and scheduler
         optimizer = self.optimizers()
 
+        # 获取一个 batch 的训练数据
         image, text = train_batch
+
+        # 根据 minibatch_size，把 1 个 batch_size 的数据分成若干块
         n = math.ceil(len(image) // self.minibatch_size)
         image_mbs = torch.chunk(image, n)
         text_mbs = torch.chunk(text, n)
 
+        # 根据视觉和文本 backbone，分别计算两种模态的 features。并且计算相关的 acc，由于不需要训练，因此不需要开梯度反向传播
         # calculate original statistics
         with torch.no_grad():
             ims = [F.normalize(self.model.encode_image(im), dim=1) for im in image_mbs]
             txt = [F.normalize(self.model.encode_text(t), dim=1) for t in text_mbs]
+
+            # 没有很看明白这个用来干什么？
             # gather from all GPUs
             ims = self.all_gather(torch.cat(ims))
             txt = self.all_gather(torch.cat(txt))
 
+            # list 会把 tensor 的第 0 维 list 化
             if len(ims.shape) == 3:
                 ims = list(ims)
                 txt = list(txt)
@@ -75,17 +90,21 @@ class CLIPWrapper(pl.LightningModule):
                 ims = [ims]
                 txt = [txt]
 
+            # @ 是矩阵乘法。* 是矩阵点乘
             image_logits = torch.cat(ims) @ torch.cat(txt).t() * self.model.logit_scale.exp()
             ground_truth = torch.arange(len(image_logits)).long().to(image_logits.device)
             loss = (F.cross_entropy(image_logits, ground_truth) + F.cross_entropy(image_logits.t(), ground_truth)).div(2)
+            # 这部分是用来计算 image 侧和 text 侧的 acc 的
             acc_i = (torch.argmax(image_logits, 1) == ground_truth).sum()
             acc_t = (torch.argmax(image_logits, 0) == ground_truth).sum()
             self.log_dict({'loss': loss / len(ims), 'acc': (acc_i + acc_t) / 2 / len(image) / len(ims)}, prog_bar=True)
 
+        # 如果指定多个 optimizer，就只使用第一个
         if isinstance(optimizer, list):
             optimizer = optimizer[0]
         optimizer.zero_grad()
 
+        # 计算图像侧的 loss
         # image loss
         for j, mb in enumerate(image_mbs):
             images_tmp = copy.deepcopy(ims)
@@ -95,6 +114,7 @@ class CLIPWrapper(pl.LightningModule):
             loss = (F.cross_entropy(image_logits, ground_truth) + F.cross_entropy(image_logits.t(), ground_truth))/2
             self.manual_backward(loss)
 
+        # 计算文本侧的 loss
         # text loss
         for j, mb in enumerate(text_mbs):
             text_tmp = copy.deepcopy(txt)
@@ -108,6 +128,7 @@ class CLIPWrapper(pl.LightningModule):
         lr_scheduler.step()
         self.model.logit_scale.data.clamp_(-np.log(100), np.log(100))
 
+    # 一次 val 测试。计算 val 的 loss
     def validation_step(self, val_batch, idx):
         image, text = val_batch
         image_logits, text_logits = self.forward(image, text)
@@ -115,6 +136,7 @@ class CLIPWrapper(pl.LightningModule):
         loss = (F.cross_entropy(image_logits, ground_truth) + F.cross_entropy(text_logits, ground_truth)).div(2)
         self.log('val_loss', loss)
 
+    # 构建 optimizers 和 lr_scheduler
     def configure_optimizers(self):
         lr = {
             "RN50": 5e-4,
