@@ -388,3 +388,191 @@ class CustomCLIPWrapper(CLIPWrapper):
         )
 
         return {'optimizer': optimizer, 'lr_scheduler': lr_scheduler}
+
+
+# 根据业务定制化的 Image-text 中文处理 wrapper
+class ImageTextCLIPWrapper(pl.LightningModule):
+    def __init__(self,
+                 image_encoder,
+                 text_encoder,
+                 # model_name,
+                 config,
+                 minibatch_size,
+                 learning_rate=3e-3,
+                 avg_word_embs=False
+                 ):
+        """A lightning wrapper for a CLIP model as specified in the paper.
+
+        Args:
+            model_name (str): A case sensitive visual model name.
+            config (dict): A dictionary containing the CLIP instantiation parameters.
+        """
+        super().__init__()
+
+        # self.model_name = model_name
+        self.model = CLIP(**config)
+        self.minibatch_size = minibatch_size
+        # self.isViT = 'ViT' in self.model_name
+
+        self.automatic_optimization = False
+
+        # 业务定制
+        del self.model.visual
+        del self.model.transformer
+        self.model.visual = image_encoder
+        self.model.transformer = text_encoder
+        self.learning_rate = learning_rate
+        self.avg_word_embs = avg_word_embs
+    
+    # 这个函数是用来计算总共需要训练多少个 steps
+    # Sourced from https://github.com/PyTorchLightning/pytorch-lightning/issues/5449
+    @property
+    def num_training_steps(self) -> int:
+        """Total training steps inferred from datamodule and devices."""
+        dataset = self.train_dataloader()
+        if self.trainer.max_steps:
+            return self.trainer.max_steps
+
+        dataset_size = len(dataset)
+
+        num_devices = max(1, self.trainer.num_gpus, self.trainer.num_processes)
+        if self.trainer.tpu_cores:
+            num_devices = max(num_devices, self.trainer.tpu_cores)
+
+        effective_batch_size = dataset.batch_size * self.trainer.accumulate_grad_batches * num_devices
+        return (dataset_size // effective_batch_size) * self.trainer.max_epochs
+
+    # 每一个 batch 的具体训练
+    # Training loss: https://github.com/openai/CLIP/issues/83
+    # Mini-batching thanks to https://github.com/crowsonkb / https://twitter.com/RiversHaveWings
+    # Multi-GPU support: https://github.com/MicPie/clasp
+    def training_step(self, train_batch, idx):
+        # 获取训练的优化器
+        # get optimizers and scheduler
+        optimizer = self.optimizers()
+
+        # 获取一个 batch 的训练数据
+        image, text = train_batch
+
+        # 根据 minibatch_size，把 1 个 batch_size 的数据分成若干块
+        n = math.ceil(len(image) // self.minibatch_size)
+        image_mbs = torch.chunk(image, n)
+        text_mbs = torch.chunk(text, n)
+
+        # 根据视觉和文本 backbone，分别计算两种模态的 features。并且计算相关的 acc，由于不需要训练，因此不需要开梯度反向传播
+        # calculate original statistics
+        with torch.no_grad():
+            ims = [F.normalize(self.model.encode_image(im), dim=1) for im in image_mbs]
+            txt = [F.normalize(self.encode_text(t), dim=1) for t in text_mbs]
+
+            # 没有很看明白这个用来干什么？
+            # gather from all GPUs
+            ims = self.all_gather(torch.cat(ims))
+            txt = self.all_gather(torch.cat(txt))
+
+            # list 会把 tensor 的第 0 维 list 化
+            if len(ims.shape) == 3:
+                ims = list(ims)
+                txt = list(txt)
+            else:
+                ims = [ims]
+                txt = [txt]
+
+            # @ 是矩阵乘法。* 是矩阵点乘
+            image_logits = torch.cat(ims) @ torch.cat(txt).t() * self.model.logit_scale.exp()
+            ground_truth = torch.arange(len(image_logits)).long().to(image_logits.device)
+            loss = (F.cross_entropy(image_logits, ground_truth) + F.cross_entropy(image_logits.t(), ground_truth)).div(2)
+            # 这部分是用来计算 image 侧和 text 侧的 acc 的
+            acc_i = (torch.argmax(image_logits, 1) == ground_truth).sum()
+            acc_t = (torch.argmax(image_logits, 0) == ground_truth).sum()
+            self.log_dict({'loss': loss / len(ims), 'acc': (acc_i + acc_t) / 2 / len(image) / len(ims)}, prog_bar=True)
+
+        # 如果指定多个 optimizer，就只使用第一个
+        if isinstance(optimizer, list):
+            optimizer = optimizer[0]
+        optimizer.zero_grad()
+
+        # 计算图像侧的 loss
+        # image loss
+        for j, mb in enumerate(image_mbs):
+            images_tmp = copy.deepcopy(ims)
+            images_tmp[self.global_rank][j*self.minibatch_size:(j+1)*self.minibatch_size] = F.normalize(self.model.encode_image(mb), dim=1)
+            image_logits = torch.cat(images_tmp) @ torch.cat(txt).t() * self.model.logit_scale.exp()
+            ground_truth = torch.arange(len(image_logits)).long().to(image_logits.device)
+            loss = (F.cross_entropy(image_logits, ground_truth) + F.cross_entropy(image_logits.t(), ground_truth))/2
+            self.manual_backward(loss)
+
+        # 计算文本侧的 loss
+        # text loss
+        for j, mb in enumerate(text_mbs):
+            text_tmp = copy.deepcopy(txt)
+            text_tmp[self.global_rank][j*self.minibatch_size:(j+1)*self.minibatch_size] = F.normalize(self.encode_text(mb), dim=1)
+            image_logits = torch.cat(ims) @ torch.cat(text_tmp).t() * self.model.logit_scale.exp()
+            loss = (F.cross_entropy(image_logits, ground_truth) + F.cross_entropy(image_logits.t(), ground_truth))/2
+            self.manual_backward(loss)
+
+        optimizer.step()
+        lr_scheduler = self.lr_schedulers()
+        lr_scheduler.step()
+        self.model.logit_scale.data.clamp_(-np.log(100), np.log(100))
+
+
+    # 一次 val 测试。计算 val 的 loss
+    def validation_step(self, val_batch, idx):
+        image, text = val_batch
+        image_logits, text_logits = self.forward(image, text)
+        ground_truth = torch.arange(len(image_logits))
+        loss = (F.cross_entropy(image_logits, ground_truth) + F.cross_entropy(text_logits, ground_truth)).div(2)
+        self.log('val_loss', loss)
+
+
+    def encode_text(self, inputs):
+        if self.avg_word_embs:
+            sequence_output = self.model.transformer(**inputs)[0]
+
+            embeddings = torch.sum(
+                sequence_output * inputs["attention_mask"].unsqueeze(-1), dim=1
+            ) / torch.clamp(torch.sum(inputs["attention_mask"], dim=1, keepdims=True), min=1e-9)
+
+            return embeddings
+        else:
+            return self.model.transformer(**inputs)[1]
+
+
+    def forward(self, images, text):
+        logits = F.normalize(self.model.encode_image(images), dim=1) @ F.normalize(self.encode_text(text), dim=1).t() * self.model.logit_scale.exp()
+        return logits, logits.t()
+
+
+    # 构建 optimizers 和 lr_scheduler
+    def configure_optimizers(self):
+        lr = self.learning_rate
+
+        # optimizer = torch.optim.AdamW(
+        #     self.model.parameters(),
+        #     lr=lr,
+        #     betas=(
+        #         0.9,
+        #         0.98 if self.isViT else 0.999
+        #     ),
+        #     eps=1e-6 if self.isViT else 1e-8,
+        #     weight_decay=0.2
+        # )
+        optimizer = torch.optim.SGD(
+            self.parameters(),
+            lr=lr,
+            momentum=0.9
+        )
+
+        # Source: https://github.com/openai/CLIP/issues/107
+        # Use pip install 'git+https://github.com/katsura-jp/pytorch-cosine-annealing-with-warmup'
+        lr_scheduler = CosineAnnealingWarmupRestarts(
+            optimizer,
+            first_cycle_steps=self.num_training_steps,
+            cycle_mult=1.0,
+            max_lr=lr,
+            min_lr=0,
+            warmup_steps=2000
+        )
+
+        return {'optimizer': optimizer, 'lr_scheduler': lr_scheduler}
